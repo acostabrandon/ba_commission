@@ -1,14 +1,18 @@
 """Commission calculation engine (Boston Aesthetics comp plan).
 
 Two gates combine on Standard/Financed deals:
-  * DELIVERY  — bundle 50/50, held back ONLY because a PICO is backordered.
-  * COLLECTION — commission pays on the CASH ACTUALLY CLEARED, at the rate,
-                 capped by the delivered half. Not a percent of the whole deal.
+  * DELIVERY  — bundle 50/50, held back ONLY because a PICO is backordered. There is
+                no delivery register: the sales admin sets each order's delivery
+                release (0% / 50% / 100%) in the app (carried in overrides).
+  * COLLECTION — commission pays on the CASH ACTUALLY CLEARED IN THIS PERIOD, at the
+                rate, capped by the delivered half. Not a percent of the whole deal.
+                Only payments whose Date falls within the run's period and that are
+                marked cleared are counted.
 
 Per rep, for a Standard/Financed order:
     net              = net commissionable amount
-    rel              = delivery fraction (0 / 0.5 / 1.0)
-    cleared          = cash cleared in the bank (from the payments block)
+    rel              = delivery fraction (0 / 0.5 / 1.0), set per order in the app
+    cleared          = cash cleared IN PERIOD (from the payments block)
     cleared_capped   = min(cleared, net)          # never pay on more than net
     delivered_base   = net * rel                  # commissionable freed by delivery
     payable_base     = min(cleared_capped, delivered_base)
@@ -20,13 +24,13 @@ Per rep, for a Standard/Financed order:
 
 Commission types:
   * Standard            -> price-card matrix rate (entered per order)
-  * In-House Financing  -> 6% of each cleared payment (down payment + monthlies);
-                           not a pre-order, so the delivery holdback does NOT apply
+  * In-House Financing  -> 6% of each cleared (in-period) payment; no delivery holdback
   * Quarter Accelerator -> per rep, >= 6 straight-purchase devices in the quarter -> 16%
   * Super Kicker        -> per rep, >= $1,000,000 straight-purchase volume in the quarter -> 22%
 Accelerator/Kicker apply to STRAIGHT purchases only and are retroactive within the run.
 """
 from __future__ import annotations
+import datetime
 from collections import defaultdict
 from money import r2
 
@@ -38,20 +42,49 @@ KICKER_RATE = 0.22
 STRAIGHT = "Straight Purchase"
 FINANCED = "Financed Purchase"
 INHOUSE = "In-House Financed Purchase"
+DEVICES = ("ZenTite", "Boston Pico")
 
 
-def _delivered_products(order_number, deliveries):
-    return {d.get("product") for d in deliveries
-            if str(d.get("order_number")) == str(order_number) and d.get("delivery_date")}
+def is_bundle(order):
+    """A bundle = both devices present, or the deal type says so ('ZT + PICO Bundle')."""
+    dt = str(order.get("deal_type") or "").lower()
+    if "bundle" in dt or ("zt" in dt and "pico" in dt):
+        return True
+    dtypes = set(order.get("device_types", []))
+    return set(DEVICES) <= dtypes
 
 
-def release_fraction(order, deliveries):
-    """Delivery factor. Only bundles (a backordered 2nd device) are held back."""
-    delivered = _delivered_products(order["order_number"], deliveries)
-    if order.get("deal_type") == "Bundle" or order.get("release_rule") == "Bundle 50/50":
-        n = sum(1 for p in ("ZenTite", "Boston Pico") if p in delivered)
-        return {0: 0.0, 1: 0.5, 2: 1.0}[min(n, 2)]
-    return 1.0 if delivered else 0.0
+def _parse_date(x):
+    if isinstance(x, datetime.datetime):
+        return x.date()
+    if isinstance(x, datetime.date):
+        return x
+    if isinstance(x, str) and x.strip():
+        try:
+            return datetime.date.fromisoformat(x.strip()[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _in_period(pdate, period):
+    """period = (start_iso, end_iso) or None. No period -> always True."""
+    if not period:
+        return True
+    start = _parse_date(period[0]); end = _parse_date(period[1])
+    if pdate is None:
+        return None            # unknown — caller decides / flags
+    if start and pdate < start:
+        return False
+    if end and pdate > end:
+        return False
+    return True
+
+
+def default_release(order):
+    """Fallback delivery fraction when the app hasn't set one: bundles assume the
+    first (ZenTite) device delivered and the PICO backordered = 50%; singles = 100%."""
+    return 0.5 if is_bundle(order) else 1.0
 
 
 def _prior_for(order_number, rep_id, opening_history):
@@ -60,11 +93,26 @@ def _prior_for(order_number, rep_id, opening_history):
                   and str(h.get("rep_id")) == str(rep_id)))
 
 
-def _cleared(payments):
-    return r2(sum((p.get("amount") or 0) for p in (payments or []) if p.get("cleared")))
+def _cleared(payments, period, notes=None, onum=""):
+    """Sum cleared payments whose Date falls in the period. Cleared-but-undated
+    payments are counted and flagged (so the admin can verify)."""
+    total = 0.0
+    for p in (payments or []):
+        if not p.get("cleared"):
+            continue
+        pdate = _parse_date(p.get("date"))
+        ip = _in_period(pdate, period)
+        if ip is True:
+            total += (p.get("amount") or 0)
+        elif ip is None:
+            total += (p.get("amount") or 0)
+            if notes is not None:
+                notes.append(f"{onum}: a cleared payment has no date — counted this period; add a date to be sure")
+        # ip False -> outside the period, skip
+    return r2(total)
 
 
-def calculate(orders, deliveries, reps_master, opening_history, overrides=None):
+def calculate(orders, reps_master, opening_history, overrides=None, period=None):
     overrides = overrides or {}
     exceptions = []
 
@@ -79,11 +127,13 @@ def calculate(orders, deliveries, reps_master, opening_history, overrides=None):
         contract = ov.get("contract_price") or o.get("contract_price") or o.get("invoice_total") \
             or o.get("net_commissionable") or 0.0
         payments = ov.get("payments") or o.get("payments") or []
-        cleared = _cleared(payments)
+        cleared = _cleared(payments, period, exceptions, onum)
         has_payments = len(payments) > 0
-        rel = release_fraction(o, deliveries)
-        sheet_names = {str(r["rep_id"]): r.get("rep_name") for r in o.get("reps", []) if r.get("rep_id")}
+        # delivery release: app override wins; else fall back to the confirmed default
+        rel = ov.get("release_fraction")
+        rel = default_release(o) if rel in (None, "") else float(rel)
         if ov.get("reps") is not None:
+            sheet_names = {str(r["rep_id"]): r.get("rep_name") for r in o.get("reps", []) if r.get("rep_id")}
             reps = [{"rep_id": str(rid), "share": sh, "rep_name": sheet_names.get(str(rid))}
                     for rid, sh in ov["reps"].items()]
         else:
@@ -116,7 +166,7 @@ def calculate(orders, deliveries, reps_master, opening_history, overrides=None):
         o, onum = R["o"], R["onum"]
         finance, net, rel = R["finance"], R["net"], R["rel"]
 
-        if o.get("deal_type") == "Bundle" and not ({"ZenTite", "Boston Pico"} <= set(o.get("device_types", []))):
+        if is_bundle(o) and not ({"ZenTite", "Boston Pico"} <= set(o.get("device_types", []))):
             exceptions.append(f"{onum}: Bundle is missing a ZenTite or Boston Pico line")
         if net is not None and net < 0:
             exceptions.append(f"{onum}: net commissionable is negative")
@@ -126,25 +176,23 @@ def calculate(orders, deliveries, reps_master, opening_history, overrides=None):
         if R["reps"] and ssum != 1.0:
             exceptions.append(f"{onum}: rep shares total {ssum:.4f} (should be 1.0)")
 
-        # ---- collection base: cash actually cleared, capped at net ----
+        # ---- collection base: cash cleared in period, capped at net ----
         if finance == INHOUSE:
             coll_disp = None
             if not R["has_payments"]:
                 exceptions.append(f"{onum}: In-House deal has no payments recorded — no commission accrues yet")
             cleared_capped = None
             payable_base = None
+            delivered_base = None
         else:
             if finance in (STRAIGHT, FINANCED) and R["base_rate"] is None:
                 exceptions.append(f"{onum}: commission rate not set")
-            if R["has_payments"]:
-                cleared_eff = R["cleared"]
-            else:
-                cleared_eff = net if net is not None else 0.0
-                exceptions.append(f"{onum}: no payments recorded — assuming fully collected for commission")
-            cleared_capped = r2(min(cleared_eff, net)) if net is not None else r2(cleared_eff)
+            if not R["has_payments"]:
+                exceptions.append(f"{onum}: no payments recorded — nothing has cleared, so no commission this period")
+            cleared_capped = r2(min(R["cleared"], net)) if net is not None else r2(R["cleared"])
             delivered_base = r2((net or 0) * rel)
             payable_base = r2(min(cleared_capped, delivered_base))
-            coll_disp = None if not net else round(cleared_capped / net, 6)  # informational: % of net cleared
+            coll_disp = None if not net else round(cleared_capped / net, 6)  # % of net cleared in period
 
         rep_lines = []
         order_deal_comm = 0.0
@@ -156,8 +204,8 @@ def calculate(orders, deliveries, reps_master, opening_history, overrides=None):
             if finance == INHOUSE:
                 ctype = "In-House Financing"
                 eff = INHOUSE_RATE
-                full = None                                   # not net-based
-                earned = r2(INHOUSE_RATE * R["cleared"] * share)   # 6% of cleared payments
+                full = None
+                earned = r2(INHOUSE_RATE * R["cleared"] * share)   # 6% of cleared (in-period) payments
                 dfac, cfac = 1.0, None
                 deliv_hold = coll_hold = 0.0
             else:
@@ -180,7 +228,6 @@ def calculate(orders, deliveries, reps_master, opening_history, overrides=None):
                         deliv_hold = r2(full - delivered_full)
                         coll_hold = r2(delivered_full - earned)
                     dfac = rel
-                    # per-rep collection factor for display: cleared vs delivered-eligible
                     denom = r2((net or 0) * rel)
                     cfac = None if denom == 0 else round(payable_base / denom, 6)
             this_period = r2((earned or 0) - prior) if earned is not None else None

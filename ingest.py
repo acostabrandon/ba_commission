@@ -15,7 +15,13 @@ def _named_value(wb, name):
     if dn is None:
         return None
     for sheet, coord in dn.destinations:
-        return wb[sheet][coord.replace("$", "")].value
+        coord = (coord or "").replace("$", "")
+        if not coord:            # a named cell whose reference was cleared/broken
+            return None
+        try:
+            return wb[sheet][coord].value
+        except (KeyError, IndexError):
+            return None
     return None
 
 
@@ -24,8 +30,11 @@ def _named_range_rows(wb, name):
     if dn is None:
         return []
     for sheet, coord in dn.destinations:
+        coord = (coord or "").replace("$", "")
+        if not coord:
+            return []
         ws = wb[sheet]
-        minc, minr, maxc, maxr = range_boundaries(coord.replace("$", ""))
+        minc, minr, maxc, maxr = range_boundaries(coord)
         return [[ws.cell(r, c).value for c in range(minc, maxc + 1)] for r in range(minr, maxr + 1)]
     return []
 
@@ -166,32 +175,14 @@ def parse_order_workbook(data: bytes, filename: str = "") -> dict:
     order["invoice_total"] = r2(subtotal + order["sales_tax"])
     order["deal_commission"] = r2(net * rate) if rate is not None else None
     order["device_types"] = [l["type"] for l in lines if l["type"] in DEVICE_TYPES]
-    # contract price: sheet value if present, else invoice total
+    # contract price: sheet value if a plain number; a formula string (data_only=False)
+    # or anything non-numeric falls back to the invoice total.
     cp = order.get("contract_price")
-    order["contract_price"] = order["invoice_total"] if cp in (None, "") else _num(cp)
-    return order
-
-
-def parse_delivery_register(data: bytes) -> list[dict]:
-    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-    ws = _find_table_anywhere(wb, "tblDeliveryRegister")
-    if ws is None:
-        ws = wb["Delivery Register"] if "Delivery Register" in wb.sheetnames else wb.active
-        headers, rows = None, [[c.value for c in r] for r in ws.iter_rows(min_row=1)]
+    if isinstance(cp, (int, float)):
+        order["contract_price"] = float(cp)
     else:
-        _, rows = _table_rows(ws, "tblDeliveryRegister")
-    out = []
-    for row in rows:
-        onum, part, product, ddate = (list(row) + [None, None, None, None])[:4]
-        if onum in (None, "") and product in (None, ""):
-            continue
-        if isinstance(ddate, datetime.datetime):
-            ddate = ddate.date().isoformat()
-        elif ddate:
-            ddate = str(ddate)
-        out.append({"order_number": onum, "part_number": part, "product": product,
-                    "delivery_date": ddate or None})
-    return out
+        order["contract_price"] = order["invoice_total"]
+    return order
 
 
 def parse_setup_reps(data: bytes) -> dict:

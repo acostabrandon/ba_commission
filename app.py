@@ -75,24 +75,18 @@ def save(msg=None, status=None):
 
 # ============================ 1 · INPUTS ============================
 with tabs[0]:
-    st.markdown("Upload the delivery register, the setup workbook, and the four order workbooks "
-                "(individually, or a single ZIP that also contains the LPS PDFs named `BA-2608-00X_LPS.pdf`).")
+    st.markdown("Upload the setup workbook (rep master + opening history) and the order workbooks "
+                "for **this payroll period only** (individually, or a single ZIP that also contains the "
+                "LPS PDFs named `BA-2608-00X_LPS.pdf`). No delivery register needed — you set each "
+                "bundle's delivery status on the Review tab.")
     disabled = locked
-    c1, c2 = st.columns(2)
-    with c1:
-        reg = st.file_uploader("Delivery register (.xlsx)", type=["xlsx"], disabled=disabled)
-        if reg is not None:
-            payload["deliveries"] = ingest.parse_delivery_register(reg.getvalue())
-            save("Uploaded delivery register")
-            st.success(f"Register: {len(payload['deliveries'])} device rows")
-    with c2:
-        setup = st.file_uploader("Setup workbook (.xlsx)", type=["xlsx"], disabled=disabled)
-        if setup is not None:
-            data = setup.getvalue()
-            payload["reps_master"] = ingest.parse_setup_reps(data)
-            payload["opening_history"] = ingest.parse_opening_history(data)
-            save("Uploaded setup workbook")
-            st.success(f"Reps: {len(payload['reps_master'])} · opening-history rows: {len(payload.get('opening_history', []))}")
+    setup = st.file_uploader("Setup workbook (.xlsx)", type=["xlsx"], disabled=disabled)
+    if setup is not None:
+        data = setup.getvalue()
+        payload["reps_master"] = ingest.parse_setup_reps(data)
+        payload["opening_history"] = ingest.parse_opening_history(data)
+        save("Uploaded setup workbook")
+        st.success(f"Reps: {len(payload['reps_master'])} · opening-history rows: {len(payload.get('opening_history', []))}")
 
     st.markdown("**Order workbooks / ZIP**")
     ups = st.file_uploader("Order workbooks (.xlsx) or a .zip with workbooks + LPS PDFs",
@@ -225,20 +219,38 @@ with tabs[1]:
                     tot = sum(sh_over.values())
                     (st.success if abs(tot - 1.0) < 1e-6 else st.warning)(f"Shares total {tot*100:.0f}%")
 
-                st.markdown("**Finance & payments**")
+                st.markdown("**Finance, delivery & payments**")
                 ft_opts = ["Straight Purchase", "Financed Purchase", "In-House Financed Purchase"]
                 cur_ft = ov.get("finance_type") or o.get("finance_type") or "Straight Purchase"
                 if cur_ft not in ft_opts:
                     cur_ft = "Straight Purchase"
-                fc1, fc2 = st.columns(2)
+                fc1, fc2, fc3 = st.columns(3)
                 ov["finance_type"] = fc1.selectbox("Finance type", ft_opts, index=ft_opts.index(cur_ft),
                                                    key=f"ft_{onum}", disabled=locked)
+
+                # delivery release — replaces the old delivery register
+                bundle = calc.is_bundle(o)
+                if bundle:
+                    dlv_opts = [("Neither delivered (0%)", 0.0),
+                                ("First device delivered — PICO backordered (50%)", 0.5),
+                                ("Both delivered (100%)", 1.0)]
+                else:
+                    dlv_opts = [("Not delivered (0%)", 0.0), ("Delivered (100%)", 1.0)]
+                cur_rel = ov.get("release_fraction")
+                if cur_rel in (None, ""):
+                    cur_rel = calc.default_release(o)
+                idx = next((i for i, (_, v) in enumerate(dlv_opts) if abs(v - float(cur_rel)) < 1e-6), 0)
+                pick = fc2.selectbox("Delivery status", [lbl for lbl, _ in dlv_opts], index=idx,
+                                     key=f"dlv_{onum}", disabled=locked)
+                ov["release_fraction"] = dict(dlv_opts)[pick]
+
                 default_contract = ov.get("contract_price") or o.get("contract_price") or o.get("invoice_total") or o.get("net_commissionable") or 0.0
-                ov["contract_price"] = round(fc2.number_input("Contract price (total the customer pays)", min_value=0.0,
+                ov["contract_price"] = round(fc3.number_input("Contract price (total the customer pays)", min_value=0.0,
                                              value=float(default_contract), step=100.0, key=f"cp_{onum}", disabled=locked), 2)
-                st.caption("Payments — each collected amount. Standard/Financed deals pay commission on the cash actually "
-                           "cleared (capped at net), gated by the delivered half; In-House pays 6% of each cleared payment. "
-                           "Check 'Cleared' once funds hit the bank.")
+                st.caption("Payments — each collected amount with its date. Only payments dated within this run's "
+                           "period and marked 'Cleared' count toward commission. Standard/Financed deals pay on the "
+                           "cash cleared (capped at net), gated by the delivered half; In-House pays 6% of each cleared "
+                           "payment. Check 'Cleared' once funds hit the bank.")
                 seed = ov.get("payments") or o.get("payments") or [{"date": "", "amount": 0.0, "kind": "Down Payment", "cleared": True}]
                 edited = st.data_editor(
                     seed, num_rows="dynamic", key=f"pay_{onum}", disabled=locked, hide_index=True,
@@ -254,9 +266,9 @@ with tabs[1]:
 
         cc1, cc2 = st.columns([1, 3])
         if cc1.button("💾 Save & recalculate", disabled=locked, type="primary"):
-            res, summ, exc = calc.calculate(orders, payload.get("deliveries", []),
-                                            payload.get("reps_master", {}), payload.get("opening_history", []),
-                                            overrides=overrides)
+            res, summ, exc = calc.calculate(orders, payload.get("reps_master", {}),
+                                            payload.get("opening_history", []), overrides=overrides,
+                                            period=(run["period_start"], run["period_end"]))
             payload["results"] = {"orders": res, "rep_summary": summ, "exceptions": exc,
                                   "control": calc.control_totals(res)}
             save("Recalculated")

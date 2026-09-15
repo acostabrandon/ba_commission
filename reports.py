@@ -136,7 +136,6 @@ def build_rep_packet(rep_id, run, lps_by_order: dict, company="Boston Aesthetics
     p = run["payload"]
     order_results = p.get("results", {}).get("orders", [])
     reps_master = p.get("reps_master", {})
-    deliveries = p.get("deliveries", [])
     orders_raw = {str(o["order_number"]): o for o in p.get("orders", [])}
     info = reps_master.get(str(rep_id), {})
     name = info.get("name", rep_id)
@@ -215,7 +214,7 @@ def build_rep_packet(rep_id, run, lps_by_order: dict, company="Boston Aesthetics
         total_comm = r2(total_comm + commissionable); gross = r2(gross + gross_i)
         deliv_hold_t = r2(deliv_hold_t + dh); coll_hold_t = r2(coll_hold_t + ch)
         collected_cleared = r2(collected_cleared + (o.get("cleared") or 0) * share)
-        devices_sold += 2 if o.get("configuration") == "Bundle" else 1
+        devices_sold += 2 if "bundle" in str(o.get("configuration") or "").lower() else 1
         tiers.add(rl.get("commission_type"))
         linemx.append(dict(o=o, rl=rl, commissionable=commissionable, gross_i=gross_i,
                            finance_short=FIN_SHORT.get(o.get("finance_type"), o.get("finance_type") or "—"),
@@ -366,14 +365,14 @@ def build_rep_packet(rep_id, run, lps_by_order: dict, company="Boston Aesthetics
             cb = [["Commission type", rl.get("commission_type", "")],
                   ["Commission rate", pct(rl.get("effective_rate"))],
                   ["Contract price (customer total)", money(o.get("contract_price"))],
-                  ["Cleared payments to date", money(o.get("cleared"))],
+                  ["Cleared payments this period", money(o.get("cleared"))],
                   [f"6% of cleared × your share ({pct(share)})", money(rl.get("earned_to_date"))]]
         else:
             cb = [["Commission type", rl.get("commission_type", "")],
                   ["Commission rate", pct(rl.get("effective_rate"))],
                   [f"Full commission — net × rate × share ({pct(share)})", money(full)],
                   ["Contract price (customer total)", money(o.get("contract_price"))],
-                  ["Cash cleared to date", money(o.get("cleared"))],
+                  ["Cash cleared this period", money(o.get("cleared"))],
                   ["Delivery release", pct(rl.get("delivery_factor"))],
                   ["Less: delivery holdback (undelivered device)", money(-(rl.get("delivery_holdback") or 0))],
                   ["Less: collection holdback (awaiting cleared cash)", money(-(rl.get("collection_holdback") or 0))],
