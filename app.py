@@ -100,32 +100,55 @@ with tabs[0]:
     if ups:
         orders = {o["order_number"]: o for o in payload.get("orders", [])}
         n_lps = 0
+        errors = []
+
+        def _skip(name):
+            base = name.split("/")[-1]
+            # skip directories and macOS/Office junk that isn't a real file
+            return (name.endswith("/") or "__MACOSX" in name or base.startswith("._")
+                    or base.startswith("~$") or base.startswith("."))
+
+        def _add_order(b, base):
+            try:
+                o = ingest.parse_order_workbook(b, base)
+            except Exception as ex:
+                errors.append(f"{base}: not a readable .xlsx ({ex})"); return
+            if o.get("order_number"):
+                orders[o["order_number"]] = o
+            else:
+                errors.append(f"{base}: no Order Number found (is this a commission-detail workbook?)")
+
         for up in ups:
             if up.name.lower().endswith(".zip"):
-                zf = zipfile.ZipFile(io.BytesIO(up.getvalue()))
+                try:
+                    zf = zipfile.ZipFile(io.BytesIO(up.getvalue()))
+                except Exception as ex:
+                    errors.append(f"{up.name}: not a valid ZIP ({ex})"); continue
                 for nm in zf.namelist():
-                    if nm.endswith("/"):
+                    if _skip(nm):
                         continue
                     base = nm.split("/")[-1]
-                    b = zf.read(nm)
-                    if base.lower().endswith(".xlsx"):
-                        o = ingest.parse_order_workbook(b, base)
-                        if o["order_number"]:
-                            orders[o["order_number"]] = o
-                    elif base.lower().endswith(".pdf"):
-                        db.save_attachment(run_id, "lps", base, b); n_lps += 1
+                    low = base.lower()
+                    if low.endswith(".xlsx"):
+                        _add_order(zf.read(nm), base)
+                    elif low.endswith(".pdf"):
+                        db.save_attachment(run_id, "lps", base, zf.read(nm)); n_lps += 1
             elif up.name.lower().endswith(".xlsx"):
-                o = ingest.parse_order_workbook(up.getvalue(), up.name)
-                if o["order_number"]:
-                    orders[o["order_number"]] = o
+                _add_order(up.getvalue(), up.name)
+            elif up.name.lower().endswith(".pdf"):
+                db.save_attachment(run_id, "lps", up.name, up.getvalue()); n_lps += 1
         payload["orders"] = list(orders.values())
         save(f"Ingested {len(orders)} order(s), {n_lps} LPS PDF(s)")
         st.success(f"{len(orders)} order(s) loaded" + (f", {n_lps} LPS PDF(s) stored" if n_lps else ""))
+        if errors:
+            st.warning("Some files were skipped:\n\n- " + "\n- ".join(errors))
 
     if payload.get("orders"):
         st.dataframe([{"Order": o["order_number"], "Customer": o["customer"], "Deal": o["deal_type"],
+                       "Finance": o.get("finance_type"),
                        "Net": o["net_commissionable"], "Rate": o["commission_rate"],
-                       "Reps": ", ".join(str(r["rep_id"]) for r in o.get("reps", []))}
+                       "Reps": ", ".join(f"{(r.get('rep_name') or r['rep_id'])} ({r['rep_id']})"
+                                         for r in o.get("reps", []) if r.get("rep_id"))}
                       for o in payload["orders"]], use_container_width=True, hide_index=True)
     lps_files = db.list_attachments(run_id, "lps")
     if lps_files:
@@ -137,9 +160,44 @@ with tabs[1]:
     if not orders:
         st.info("Upload inputs on the Inputs tab first.")
     else:
-        st.markdown("Set each order's **commission rate** and confirm the **rep split** (shares total 100%). "
+        st.markdown("Set each order's **finance type, commission rate, rep split, and payments**. "
                     "Changes here override the sheet without editing it. Then recalculate.")
         overrides = payload.setdefault("overrides", {})
+
+        # rep-name lookup: setup workbook first, else the name carried on the sheet
+        rmaster0 = payload.get("reps_master", {})
+        name_by_rid = {}
+        for o in orders:
+            for r in o.get("reps", []):
+                if r.get("rep_id"):
+                    name_by_rid[str(r["rep_id"])] = r.get("rep_name") or str(r["rep_id"])
+        for rid, info in rmaster0.items():
+            if info.get("name"):
+                name_by_rid[str(rid)] = info["name"]
+
+        def rep_name(rid):
+            return name_by_rid.get(str(rid), str(rid))
+
+        # ---- statement details (fill in what the workbooks don't carry) ----
+        sf = payload.setdefault("statement_fields", {})
+        with st.expander("Statement details — payroll date, territory, manager, quarterly revenue, comments", expanded=False):
+            sf["payroll_date"] = st.text_input("Payroll date (applies to all statements)",
+                                               value=sf.get("payroll_date", ""), key="payroll_date", disabled=locked)
+            rmaster = payload.get("reps_master", {})
+            rep_fields = sf.setdefault("reps", {})
+            appearing = sorted({str(r["rep_id"]) for o in orders for r in o.get("reps", []) if r.get("rep_id")})
+            for rid in appearing:
+                rf = rep_fields.setdefault(rid, {})
+                nm = rep_name(rid)
+                st.markdown(f"**{nm} ({rid})**")
+                c1, c2, c3 = st.columns(3)
+                rf["territory"] = c1.text_input("Territory", value=rf.get("territory", ""), key=f"terr_{rid}", disabled=locked)
+                rf["manager"] = c2.text_input("Manager", value=rf.get("manager", ""), key=f"mgr_{rid}", disabled=locked)
+                rf["quarterly_revenue"] = c3.text_input("Quarterly revenue", value=rf.get("quarterly_revenue", ""), key=f"qr_{rid}", disabled=locked)
+                rf["comments"] = st.text_area("Comments", value=rf.get("comments", ""), key=f"cmt_{rid}", height=68, disabled=locked)
+            if st.button("💾 Save statement details", disabled=locked):
+                save("Updated statement details"); st.rerun()
+
         for o in orders:
             onum = str(o["order_number"])
             ov = overrides.setdefault(onum, {})
@@ -155,7 +213,7 @@ with tabs[1]:
                 if rep_ids:
                     cols = st.columns(len(rep_ids))
                     for i, rid in enumerate(rep_ids):
-                        nm = payload.get("reps_master", {}).get(rid, {}).get("name", rid)
+                        nm = rep_name(rid)
                         d = sh_over.get(rid)
                         if d is None:
                             src = next((r["share"] for r in reps if str(r["rep_id"]) == rid), None)
@@ -166,6 +224,33 @@ with tabs[1]:
                         sh_over[rid] = round(val / 100.0, 6)
                     tot = sum(sh_over.values())
                     (st.success if abs(tot - 1.0) < 1e-6 else st.warning)(f"Shares total {tot*100:.0f}%")
+
+                st.markdown("**Finance & payments**")
+                ft_opts = ["Straight Purchase", "Financed Purchase", "In-House Financed Purchase"]
+                cur_ft = ov.get("finance_type") or o.get("finance_type") or "Straight Purchase"
+                if cur_ft not in ft_opts:
+                    cur_ft = "Straight Purchase"
+                fc1, fc2 = st.columns(2)
+                ov["finance_type"] = fc1.selectbox("Finance type", ft_opts, index=ft_opts.index(cur_ft),
+                                                   key=f"ft_{onum}", disabled=locked)
+                default_contract = ov.get("contract_price") or o.get("contract_price") or o.get("invoice_total") or o.get("net_commissionable") or 0.0
+                ov["contract_price"] = round(fc2.number_input("Contract price (total the customer pays)", min_value=0.0,
+                                             value=float(default_contract), step=100.0, key=f"cp_{onum}", disabled=locked), 2)
+                st.caption("Payments — each collected amount. Standard/Financed deals pay commission on the cash actually "
+                           "cleared (capped at net), gated by the delivered half; In-House pays 6% of each cleared payment. "
+                           "Check 'Cleared' once funds hit the bank.")
+                seed = ov.get("payments") or o.get("payments") or [{"date": "", "amount": 0.0, "kind": "Down Payment", "cleared": True}]
+                edited = st.data_editor(
+                    seed, num_rows="dynamic", key=f"pay_{onum}", disabled=locked, hide_index=True,
+                    column_config={
+                        "date": st.column_config.TextColumn("Date"),
+                        "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+                        "kind": st.column_config.SelectboxColumn("Kind", options=["Down Payment", "Installment", "Payoff", "Paid in Full", "Other"]),
+                        "cleared": st.column_config.CheckboxColumn("Cleared?"),
+                    })
+                ov["payments"] = [dict(date=r.get("date", ""), amount=float(r.get("amount") or 0),
+                                       kind=r.get("kind", "Other"), cleared=bool(r.get("cleared")))
+                                  for r in edited if (r.get("amount") or 0) or r.get("date")]
 
         cc1, cc2 = st.columns([1, 3])
         if cc1.button("💾 Save & recalculate", disabled=locked, type="primary"):
@@ -193,9 +278,14 @@ with tabs[1]:
                          use_container_width=True, hide_index=True)
             st.markdown("**Per order**")
             st.dataframe([{"Order": o["order_number"], "Customer": o["customer"],
-                           "Net": o["net_commissionable"], "Rate": o["commission_rate"],
-                           "Deal comm.": o["deal_commission"], "Release": o["release_fraction"],
-                           "This period": o["period_commission"]} for o in results["orders"]],
+                           "Finance": o.get("finance_type"),
+                           "Type": ", ".join(sorted({rl["commission_type"] for rl in o["reps"]})) or "—",
+                           "Net": o["net_commissionable"],
+                           "Collected %": (None if o.get("collection_factor") is None else round(o["collection_factor"] * 100)),
+                           "Release": o["release_fraction"],
+                           "Deal comm.": o.get("deal_commission"),
+                           "This period": round(sum((rl["this_period"] or 0) for rl in o["reps"]), 2)}
+                          for o in results["orders"]],
                          use_container_width=True, hide_index=True)
 
 # ============================ 3 · APPROVE & LOCK ============================

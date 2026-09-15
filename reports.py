@@ -7,6 +7,7 @@ generated commission detail page.
 from __future__ import annotations
 import io, datetime
 import openpyxl
+from money import r2
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
 THIN = Side(style="thin", color="BFBFBF")
@@ -63,18 +64,20 @@ def build_hr_workbook(run: dict) -> bytes:
     rows = []
     for o in order_results:
         for rl in o["reps"]:
-            rows.append([o["order_number"], o["customer"], o["deal_type"], o["net_commissionable"],
-                         o["commission_rate"], o["deal_commission"], rl["rep_id"], rl["rep_name"],
-                         rl["share"], rl["release_fraction"], rl["full_commission"],
-                         rl["prior_processed"], rl["this_period"]])
+            rows.append([o["order_number"], o["customer"], o.get("finance_type"), rl.get("commission_type"),
+                         o["net_commissionable"], rl["rep_id"], rl["rep_name"], rl["share"],
+                         rl.get("effective_rate"), rl.get("delivery_factor"), rl.get("collection_factor"),
+                         (rl.get("full_commission") if rl.get("full_commission") is not None else rl.get("earned_to_date")),
+                         rl.get("prior_processed"), rl.get("this_period")])
     end = _sheet_table(ws, 1,
-                       ["Order", "Customer", "Deal Type", "Net Commissionable", "Rate", "Deal Commission",
-                        "Rep ID", "Rep Name", "Share", "Release", "Full Commission", "Prior Processed", "This Period"],
-                       rows, widths=[13, 24, 12, 16, 8, 15, 10, 20, 8, 9, 15, 14, 14])
+                       ["Order", "Customer", "Finance Type", "Commission Type", "Net Commissionable",
+                        "Rep ID", "Rep Name", "Share", "Eff. Rate", "Delivery", "Collection",
+                        "Gross Commission", "Prior Processed", "This Period"],
+                       rows, widths=[13, 22, 16, 16, 15, 9, 18, 8, 9, 9, 10, 15, 14, 14])
     for r in range(2, end):
-        for col in (4, 6, 11, 12, 13):
+        for col in (5, 12, 13, 14):
             ws.cell(r, col).number_format = CUR
-        for col in (5, 9, 10):
+        for col in (8, 9, 10, 11):
             ws.cell(r, col).number_format = PCT
 
     # Exceptions
@@ -99,11 +102,15 @@ def build_hr_workbook(run: dict) -> bytes:
 
     # Plan Snapshot
     ws = wb.create_sheet("Plan Snapshot"); ws.sheet_view.showGridLines = False
-    snap = [["Release rule", "Bundle 50/50: 0% none delivered, 50% first device, 100% both"],
-            ["Commission base", "Pre-tax subtotal (devices + discount + customer shipping); tax excluded"],
+    snap = [["Commission base", "Pre-tax subtotal (devices + discount + customer shipping); tax excluded"],
             ["Net commissionable", "Subtotal − deductions"],
-            ["Deal commission", "Net × Commission Rate (rate entered on the order sheet)"],
-            ["Rep commission", "Deal commission × rep share, then × release fraction, minus prior processed"],
+            ["Standard commission", "Net × matrix rate × share, gated by delivery and collection"],
+            ["Delivery release", "Bundle 50/50 (PICO backorder): 0% none, 50% first device, 100% both"],
+            ["Collection", "Pays on cash actually cleared (capped at net), gated by the delivered half — "
+                           "rate × min(cleared capped at net, net × delivery)"],
+            ["In-House Financing", "6% of each cleared payment (down payment + monthlies); no delivery holdback"],
+            ["Quarter Accelerator", "Per rep, ≥ 6 straight-purchase devices in the quarter → 16% (retroactive)"],
+            ["Super Kicker", "Per rep, ≥ $1,000,000 straight-purchase volume in the quarter → 22% (retroactive)"],
             ["Rounding", "Half up to the cent"]]
     _sheet_table(ws, 1, ["Policy", "Definition"], snap, widths=[26, 80])
 
@@ -111,117 +118,291 @@ def build_hr_workbook(run: dict) -> bytes:
 
 
 # ---------------- per-rep PDF packet ----------------
-def build_rep_packet(rep_id, run, lps_by_order: dict) -> bytes:
+NAVY = "#1F3A5F"
+DARK = "#333333"
+LIGHT = "#EFEFEF"
+
+
+def build_rep_packet(rep_id, run, lps_by_order: dict, company="Boston Aesthetics") -> bytes:
     from reportlab.lib.pagesizes import LETTER
     from reportlab.lib.units import inch
     from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+                                    PageBreak, HRFlowable)
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT
     from pypdf import PdfReader, PdfWriter
 
     p = run["payload"]
     order_results = p.get("results", {}).get("orders", [])
     reps_master = p.get("reps_master", {})
-    orders_raw = {o["order_number"]: o for o in p.get("orders", [])}
-    name = reps_master.get(rep_id, {}).get("name", rep_id)
+    deliveries = p.get("deliveries", [])
+    orders_raw = {str(o["order_number"]): o for o in p.get("orders", [])}
+    info = reps_master.get(str(rep_id), {})
+    name = info.get("name", rep_id)
+    today = datetime.date.today().isoformat()
 
     styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=16)
-    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=12)
-    small = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, textColor=colors.grey)
+    H1 = ParagraphStyle("H1", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=17, leading=21, spaceAfter=3, textColor=colors.HexColor(NAVY))
+    SUBT = ParagraphStyle("SUBT", parent=styles["Normal"], fontName="Helvetica", fontSize=10, textColor=colors.HexColor(DARK))
+    SEC = ParagraphStyle("SEC", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=11, textColor=colors.HexColor(NAVY), spaceBefore=7, spaceAfter=2)
+    BODY = ParagraphStyle("BODY", parent=styles["Normal"], fontSize=8.5, leading=11)
+    SMALL = ParagraphStyle("SMALL", parent=styles["Normal"], fontSize=7.5, textColor=colors.grey)
 
     def money(x):
-        return "-" if x in (None, "") else "${:,.2f}".format(x)
+        if x in (None, ""):
+            return "—"
+        return "-${:,.2f}".format(-x) if x < 0 else "${:,.2f}".format(x)
 
     def pct(x):
-        return "" if x in (None, "") else "{:.1f}%".format(x * 100)
+        return "—" if x in (None, "") else "{:.1f}%".format(x * 100)
 
-    gen = io.BytesIO()
-    doc = SimpleDocTemplate(gen, pagesize=LETTER, leftMargin=0.6 * inch, rightMargin=0.6 * inch,
-                            topMargin=0.6 * inch, bottomMargin=0.6 * inch)
-    story = []
-    # ---- cover statement ----
-    story.append(Paragraph("Boston Aesthetics — Commission Statement", h1))
-    story.append(Paragraph(f"{name} ({rep_id})", h2))
-    story.append(Paragraph(f"Run: {run['name']} &nbsp;·&nbsp; Period: {run['period_start']} to {run['period_end']} "
-                           f"&nbsp;·&nbsp; Status: {run['status']}", small))
-    story.append(Spacer(1, 10))
-    rows = [["Order", "Customer", "Release", "This Period"]]
-    total = 0.0
+    def rule():
+        return HRFlowable(width="100%", thickness=0.6, color=colors.HexColor(NAVY), spaceBefore=1, spaceAfter=6)
+
+    def kv_table(rows, col_w):
+        t = Table(rows, colWidths=col_w)
+        t.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"), ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold") if len(col_w) == 4 else ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor(DARK)),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4), ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9D9D9")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        return t
+
+    # ---- rep aggregates ----
+    lines = []
     for o in order_results:
         for rl in o["reps"]:
             if str(rl["rep_id"]) == str(rep_id):
-                rows.append([o["order_number"], (o["customer"] or "")[:34], pct(rl["release_fraction"]),
-                             money(rl["this_period"])])
-                total += rl["this_period"] or 0
-    rows.append(["", "", "TOTAL THIS PERIOD", money(round(total, 2))])
-    t = Table(rows, colWidths=[1.2 * inch, 3.0 * inch, 1.1 * inch, 1.5 * inch])
+                lines.append((o, rl))
+    sf = p.get("statement_fields", {})
+    rep_sf = (sf.get("reps", {}) or {}).get(str(rep_id), {})
+    territory = rep_sf.get("territory") or "________________"
+    manager = rep_sf.get("manager") or "________________"
+    payroll_date = sf.get("payroll_date") or "________________"
+    quarterly_rev = rep_sf.get("quarterly_revenue") or "—"
+    comments = rep_sf.get("comments") or ""
+    FIN_SHORT = {"Straight Purchase": "Straight", "Financed Purchase": "Financed",
+                 "In-House Financed Purchase": "In-House"}
+
+    linemx = []
+    total_comm = gross = deliv_hold_t = coll_hold_t = collected_cleared = 0.0
+    devices_sold = 0
+    tiers = set()
+    for o, rl in lines:
+        share = rl["share"] or 0
+        inhouse = o.get("finance_type") == "In-House Financed Purchase"
+        if inhouse:
+            commissionable = r2((o.get("cleared") or 0) * share)
+            gross_i = rl.get("earned_to_date") or 0
+            dh = ch = 0.0
+        else:
+            commissionable = r2((o["net_commissionable"] or 0) * share)
+            full = rl.get("full_commission") or 0
+            gross_i = full
+            # prefer explicit holdback amounts from the engine (cleared-cash model)
+            dh = rl.get("delivery_holdback")
+            ch = rl.get("collection_holdback")
+            if dh is None:
+                dfac = rl["delivery_factor"] if rl.get("delivery_factor") is not None else 1.0
+                dh = r2(full * (1 - dfac))
+            if ch is None:
+                ch = 0.0
+        total_comm = r2(total_comm + commissionable); gross = r2(gross + gross_i)
+        deliv_hold_t = r2(deliv_hold_t + dh); coll_hold_t = r2(coll_hold_t + ch)
+        collected_cleared = r2(collected_cleared + (o.get("cleared") or 0) * share)
+        devices_sold += 2 if o.get("configuration") == "Bundle" else 1
+        tiers.add(rl.get("commission_type"))
+        linemx.append(dict(o=o, rl=rl, commissionable=commissionable, gross_i=gross_i,
+                           finance_short=FIN_SHORT.get(o.get("finance_type"), o.get("finance_type") or "—"),
+                           ctype=rl.get("commission_type") or "—", eff=rl.get("effective_rate")))
+    prior = r2(sum((rl["prior_processed"] or 0) for _, rl in lines))
+    to_pay = r2(sum((rl["this_period"] or 0) for _, rl in lines))
+    if "Super Kicker" in tiers:
+        tier_achieved = "Super Kicker (22%)"
+    elif "Quarter Accelerator" in tiers:
+        tier_achieved = "Quarter Accelerator (16%)"
+    elif tiers == {"In-House Financing"}:
+        tier_achieved = "In-House Financing"
+    else:
+        tier_achieved = "Standard"
+    accel_earned = "Yes" if (tiers & {"Super Kicker", "Quarter Accelerator"}) else "No"
+
+    def paren(x):
+        return f"(${x:,.2f})" if x and x > 0.005 else "$0.00"
+
+    gen = io.BytesIO()
+    doc = SimpleDocTemplate(gen, pagesize=LETTER, leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+                            topMargin=0.55 * inch, bottomMargin=0.55 * inch, title=f"Commission Statement — {name}")
+    S = []
+
+    # ---- header (mirrors the Word doc) ----
+    S.append(Paragraph(f"{company} &nbsp;&nbsp;·&nbsp;&nbsp; Commissions Statement", SMALL))
+    S.append(Paragraph("Sales Commission Statement (Pre-Payroll Review)", H1))
+    S.append(rule())
+
+    # ---- employee information ----
+    S.append(Paragraph("Employee Information", SEC))
+    emp = [["Employee Name", f"{name} ({rep_id})", "Commission Period", f"{run['period_start']} – {run['period_end']}"],
+           ["Territory", territory, "Payroll Date", payroll_date],
+           ["Manager", manager, "Statement Date", today]]
+    S.append(kv_table(emp, [1.3 * inch, 2.35 * inch, 1.3 * inch, 2.35 * inch]))
+
+    # ---- commission detail (per order; finance type, commission type, commissionable, rate, earned) ----
+    S.append(Paragraph("Commission Detail", SEC))
+    rows = [["Customer", "Order", "Finance", "Comm. Type", "Commissionable", "Rate", "Earned"]]
+    for m in linemx:
+        rows.append([(m["o"]["customer"] or "")[:26], m["o"]["order_number"], m["finance_short"],
+                     m["ctype"], money(m["commissionable"]), pct(m["eff"]), money(m["gross_i"])])
+    rows.append(["", "", "", "", "", "TOTAL", money(gross)])
+    t = Table(rows, colWidths=[1.55 * inch, 0.85 * inch, 0.85 * inch, 1.15 * inch, 1.05 * inch, 0.55 * inch, 1.3 * inch])
     t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#404040")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("LINEABOVE", (0, -1), (-1, -1), 0.7, colors.black),
-        ("GRID", (0, 0), (-1, -2), 0.3, colors.HexColor("#BFBFBF")),
-        ("ALIGN", (2, 0), (-1, -1), "RIGHT"), ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(NAVY)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("LINEABOVE", (0, -1), (-1, -1), 0.7, colors.black),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.HexColor("#F6F8FA")]),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9D9D9")),
+        ("ALIGN", (4, 0), (-1, -1), "RIGHT"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
     ]))
-    story.append(t)
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Amounts reflect the current run and are not a statement that payroll has been approved "
-                           "or paid. Bundle orders release 50% on the first device and the remainder when the second "
-                           "device is delivered.", small))
+    S.append(t)
 
-    # ---- per-order commission detail ----
-    for o in order_results:
-        mine = [rl for rl in o["reps"] if str(rl["rep_id"]) == str(rep_id)]
-        if not mine:
-            continue
+    # ---- commission summary (mirrors the Word doc rows) ----
+    S.append(Paragraph("Commission Summary", SEC))
+    summ = [["Total Commissionable Revenue", money(total_comm)],
+            ["Gross Commission Earned (at 100% delivered + collected)", money(gross)],
+            ["Less: Delivery Holdback (Bundle 50/50 — PICO backorder)", paren(deliv_hold_t)],
+            ["Less: Collection Holdback (paid on cleared cash only)", paren(coll_hold_t)],
+            ["Chargebacks / Returns / Credits", "(—)"],
+            ["Prior Period Adjustments", paren(prior)],
+            ["Total Commission to be Paid", money(to_pay)]]
+    t = Table(summ, colWidths=[5.0 * inch, 2.3 * inch])
+    t.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"), ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.25, colors.HexColor("#D9D9D9")),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor(LIGHT)),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+    ]))
+    S.append(t)
+
+    # ---- performance summary (Word doc fields) ----
+    S.append(Paragraph("Performance Summary", SEC))
+    perf = [["Devices Sold", str(devices_sold), "Commission Tier Achieved", tier_achieved],
+            ["Collected Revenue (cleared)", money(collected_cleared), "Accelerator Earned", accel_earned],
+            ["Quarterly Revenue", quarterly_rev, "", ""]]
+    S.append(kv_table(perf, [1.55 * inch, 2.1 * inch, 1.7 * inch, 1.95 * inch]))
+
+    # ---- comments ----
+    S.append(Paragraph("Comments", SEC))
+    if comments:
+        cm = Table([[Paragraph(comments, BODY)]], colWidths=[7.3 * inch])
+    else:
+        cm = Table([[""]], colWidths=[7.3 * inch], rowHeights=[0.3 * inch])
+    cm.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#BFBFBF")),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("TOPPADDING", (0, 0), (-1, -1), 4),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 4), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    S.append(cm)
+
+    # ---- employee review (verbatim from the Word doc) ----
+    S.append(Paragraph("Employee Review", SEC))
+    for para in [
+        "This statement is provided prior to payroll to allow you to review the commissions scheduled for payment. "
+        "If you believe there is an error or have questions regarding any transaction, please notify your manager and "
+        "Human Resources within one (1) business day of receiving this statement.",
+        "Unless otherwise provided in your commission agreement, commissions are based on collected revenue and are "
+        "subject to adjustments for returns, credits, cancellations, chargebacks, pricing corrections, or other "
+        "applicable deductions.",
+        "Receipt of this statement does not alter the terms of your Compensation Plan or Employment Agreement."]:
+        S.append(Paragraph(para, BODY))
+        S.append(Spacer(1, 3))
+    S.append(Spacer(1, 6))
+    sig = Table([["Prepared By:", "_____________________________", "Date:", "________________"],
+                 ["Reviewed By:", "_____________________________", "Date:", "________________"]],
+                colWidths=[1.0 * inch, 3.0 * inch, 0.5 * inch, 2.0 * inch])
+    sig.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 9), ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                             ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"), ("TOPPADDING", (0, 0), (-1, -1), 9)]))
+    S.append(sig)
+
+    doc.build(S)
+
+    # ---- per order: a full Commission Detail page, then that order's LPS ----
+    def order_detail_pdf(o, rl):
         raw = orders_raw.get(o["order_number"], {})
-        story.append(PageBreak())
-        story.append(Paragraph(f"Order {o['order_number']} — {o.get('customer','')}", h2))
-        story.append(Paragraph(f"{o.get('deal_type','')} · {o.get('release_rule','')}", small))
-        story.append(Spacer(1, 6))
-        li = [["Line item", "Amount"]] + [[(l.get("description") or l.get("type") or ""), money(l.get("amount"))]
-                                          for l in raw.get("line_items", [])]
+        buf = io.BytesIO()
+        d2 = SimpleDocTemplate(buf, pagesize=LETTER, leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+                               topMargin=0.55 * inch, bottomMargin=0.55 * inch)
+        F = [Paragraph(f"Order {o['order_number']} — {o.get('customer','')}", H1),
+             Paragraph(f"{o.get('finance_type','')} &nbsp;·&nbsp; {o.get('configuration','')} &nbsp;·&nbsp; "
+                       f"Commission type: {rl.get('commission_type','')}", SUBT), rule(),
+             Paragraph("Order Commission Detail", SEC)]
+        li = [["Line item", "Amount"]]
+        for l in raw.get("line_items", []):
+            li.append([(l.get("description") or l.get("type") or ""), money(l.get("amount"))])
         li.append(["Subtotal before tax", money(raw.get("subtotal_before_tax"))])
-        for d in raw.get("deductions", []):
-            li.append([f"less: {d.get('description','')}", money(-(d.get('amount') or 0))])
+        li.append(["Sales tax (excluded from commission)", money(raw.get("sales_tax"))])
+        li.append(["Invoice total (customer)", money(raw.get("invoice_total"))])
+        for dd in raw.get("deductions", []):
+            li.append([f"less: {dd.get('description', '')}", money(-(dd.get('amount') or 0))])
         li.append(["Net commissionable", money(o["net_commissionable"])])
-        li.append([f"Commission rate", pct(o["commission_rate"])])
-        li.append(["Deal commission", money(o["deal_commission"])])
-        rl = mine[0]
-        li.append([f"Your share ({pct(rl['share'])})", money(rl["full_commission"])])
-        li.append([f"Release ({pct(rl['release_fraction'])})", money(rl["eligible_to_date"])])
-        if rl["prior_processed"]:
-            li.append(["less: prior processed", money(-rl["prior_processed"])])
-        li.append(["This period", money(rl["this_period"])])
-        t = Table(li, colWidths=[4.6 * inch, 1.6 * inch])
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#404040")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-            ("LINEABOVE", (0, -1), (-1, -1), 0.7, colors.black),
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D9D9D9")),
-            ("ALIGN", (1, 0), (1, -1), "RIGHT"), ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ]))
-        story.append(t)
-        story.append(Spacer(1, 6))
-        story.append(Paragraph("The Laser Purchase Sheet for this order follows.", small))
-    doc.build(story)
+        t1 = Table(li, colWidths=[5.0 * inch, 2.3 * inch])
+        t1.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(NAVY)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("LINEABOVE", (0, -1), (-1, -1), 0.7, colors.black),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9D9D9")), ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5)]))
+        F.append(t1)
+        F.append(Spacer(1, 8)); F.append(Paragraph("Commission Calculation", SEC))
+        share = rl.get("share")
+        full = rl.get("full_commission")
+        inhouse = o.get("finance_type") == "In-House Financed Purchase"
+        if inhouse:
+            cb = [["Commission type", rl.get("commission_type", "")],
+                  ["Commission rate", pct(rl.get("effective_rate"))],
+                  ["Contract price (customer total)", money(o.get("contract_price"))],
+                  ["Cleared payments to date", money(o.get("cleared"))],
+                  [f"6% of cleared × your share ({pct(share)})", money(rl.get("earned_to_date"))]]
+        else:
+            cb = [["Commission type", rl.get("commission_type", "")],
+                  ["Commission rate", pct(rl.get("effective_rate"))],
+                  [f"Full commission — net × rate × share ({pct(share)})", money(full)],
+                  ["Contract price (customer total)", money(o.get("contract_price"))],
+                  ["Cash cleared to date", money(o.get("cleared"))],
+                  ["Delivery release", pct(rl.get("delivery_factor"))],
+                  ["Less: delivery holdback (undelivered device)", money(-(rl.get("delivery_holdback") or 0))],
+                  ["Less: collection holdback (awaiting cleared cash)", money(-(rl.get("collection_holdback") or 0))],
+                  ["Earned to date (on cleared cash)", money(rl.get("earned_to_date"))]]
+        if rl.get("prior_processed"):
+            cb.append(["Less: prior processed", money(-rl["prior_processed"])])
+        cb.append(["Commission Earned — This Period", money(rl.get("this_period"))])
+        t2 = Table(cb, colWidths=[5.0 * inch, 2.3 * inch])
+        t2.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 9), ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+            ("LINEBELOW", (0, 0), (-1, -2), 0.25, colors.HexColor("#D9D9D9")),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor(LIGHT)), ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
+            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        F.append(t2)
+        d2.build(F)
+        return buf.getvalue()
 
-    # ---- merge generated pages + LPS PDFs ----
     writer = PdfWriter()
     for pg in PdfReader(io.BytesIO(gen.getvalue())).pages:
         writer.add_page(pg)
-    # append each relevant order's LPS right after (simple: at the end, in order)
-    for o in order_results:
-        if any(str(rl["rep_id"]) == str(rep_id) for rl in o["reps"]):
-            lps = lps_by_order.get(o["order_number"])
-            if lps:
-                try:
-                    for pg in PdfReader(io.BytesIO(lps)).pages:
-                        writer.add_page(pg)
-                except Exception:
-                    pass
+    for o, rl in lines:
+        for pg in PdfReader(io.BytesIO(order_detail_pdf(o, rl))).pages:
+            writer.add_page(pg)
+        lps = lps_by_order.get(o["order_number"])
+        if lps:
+            try:
+                for pg in PdfReader(io.BytesIO(lps)).pages:
+                    writer.add_page(pg)
+            except Exception:
+                pass
     out = io.BytesIO(); writer.write(out); return out.getvalue()

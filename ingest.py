@@ -54,6 +54,15 @@ def _num(x):
         return 0.0
 
 
+def _header_index(headers):
+    """Map lower-cased, stripped header text -> column index."""
+    out = {}
+    for i, h in enumerate(headers or []):
+        if h not in (None, ""):
+            out[str(h).strip().lower()] = i
+    return out
+
+
 def parse_order_workbook(data: bytes, filename: str = "") -> dict:
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
     ws = _find_table_anywhere(wb, "tblLineItems") or wb.active
@@ -70,6 +79,9 @@ def parse_order_workbook(data: bytes, filename: str = "") -> dict:
         "template_version": _named_value(wb, "TemplateVersion"),
         "sales_tax": _num(_named_value(wb, "SalesTax")),
         "commission_rate": _named_value(wb, "CommissionRate"),  # may be None
+        "finance_type": _named_value(wb, "FinanceType"),  # may be None -> app sets it
+        "rate_basis": _named_value(wb, "RateBasis"),
+        "contract_price": _named_value(wb, "ContractPrice"),  # may be None
     }
 
     # line items (Type, Part Number, Description, Amount)
@@ -92,17 +104,54 @@ def parse_order_workbook(data: bytes, filename: str = "") -> dict:
         ded.append({"description": desc, "amount": _num(amt)})
     order["deductions"] = ded
 
-    # rep terms (Rep ID, Share %, Commission[ignore], Note)
+    # rep terms — HEADER-BASED mapping (v1.4 adds a Rep Name column:
+    #   Rep ID | Rep Name | Share % | Commission | Note)
     reps = []
     rws = _find_table_anywhere(wb, "tblRepTerms")
     if rws is not None:
-        _, rr = _table_rows(rws, "tblRepTerms")
+        headers, rr = _table_rows(rws, "tblRepTerms")
+        idx = _header_index(headers)
+        ci_id = idx.get("rep id", 0)
+        ci_name = idx.get("rep name")
+        ci_share = idx.get("share %", idx.get("share"))
+        ci_note = idx.get("note")
         for row in rr:
-            rid, share, _comm, note = (row + [None, None, None, None])[:4]
-            if rid in (None, "") and note in (None, ""):
+            def _g(i):
+                return row[i] if (i is not None and i < len(row)) else None
+            rid = _g(ci_id)
+            name = _g(ci_name)
+            share = _g(ci_share)
+            note = _g(ci_note)
+            if rid in (None, "") and name in (None, "") and note in (None, ""):
                 continue
-            reps.append({"rep_id": rid, "share": (None if share in (None, "") else _num(share)), "note": note})
+            reps.append({"rep_id": rid, "rep_name": name,
+                         "share": (None if share in (None, "") else _num(share)), "note": note})
     order["reps"] = reps
+
+    # collections / payments — HEADER-BASED (Date | Kind | Amount | Cleared? (Y/N))
+    payments = []
+    pws = _find_table_anywhere(wb, "tblPayments")
+    if pws is not None:
+        headers, pr = _table_rows(pws, "tblPayments")
+        idx = _header_index(headers)
+        ci_date = idx.get("date", 0)
+        ci_kind = idx.get("kind")
+        ci_amt = idx.get("amount")
+        ci_cl = next((v for k, v in idx.items() if k.startswith("cleared")), None)
+        for row in pr:
+            def _g(i):
+                return row[i] if (i is not None and i < len(row)) else None
+            dte, kind, amt, cl = _g(ci_date), _g(ci_kind), _g(ci_amt), _g(ci_cl)
+            if amt in (None, "") and dte in (None, ""):
+                continue
+            cleared = str(cl).strip().upper() in ("Y", "YES", "TRUE", "1") if cl is not None else False
+            if isinstance(dte, datetime.datetime):
+                dte = dte.date().isoformat()
+            elif dte:
+                dte = str(dte)
+            payments.append({"date": dte or "", "kind": kind or "Other",
+                             "amount": _num(amt), "cleared": cleared})
+    order["payments"] = payments
 
     # recompute totals from raw inputs
     subtotal = r2(sum(l["amount"] for l in lines))
@@ -117,6 +166,9 @@ def parse_order_workbook(data: bytes, filename: str = "") -> dict:
     order["invoice_total"] = r2(subtotal + order["sales_tax"])
     order["deal_commission"] = r2(net * rate) if rate is not None else None
     order["device_types"] = [l["type"] for l in lines if l["type"] in DEVICE_TYPES]
+    # contract price: sheet value if present, else invoice total
+    cp = order.get("contract_price")
+    order["contract_price"] = order["invoice_total"] if cp in (None, "") else _num(cp)
     return order
 
 

@@ -9,9 +9,10 @@ browser and pick up where others left off — until it's approved and locked.
 
 1. **Inputs** — upload the delivery register, the setup workbook (rep master), and
    the four order workbooks (individually, or one ZIP that also holds the LPS PDFs).
-2. **Review & Calculate** — set each order's commission rate and confirm the rep
-   split; it recomputes everything from raw inputs, applies the bundle **50/50**
-   delivery release, subtracts any prior-processed amounts, and lists exceptions.
+2. **Review & Calculate** — set each order's finance type, commission rate, rep
+   split, and payments; it recomputes everything from raw inputs, applies the bundle
+   **50/50** delivery release and the **cleared-cash** collection rule, subtracts any
+   prior-processed amounts, and lists exceptions.
 3. **Approve & Lock** — move the run Draft → In review → Approved → Locked. Locking
    freezes it so finalized commissions can't change or be double-counted.
 4. **Reports** — download the **HR workbook** (Payroll Summary, Commission Detail,
@@ -20,8 +21,24 @@ browser and pick up where others left off — until it's approved and locked.
 
 The commission math mirrors the order sheet exactly: commission base = pre-tax
 subtotal (devices + discount + customer shipping); **tax is excluded**; net = subtotal
-− deductions; deal commission = net × rate; each rep = deal commission × share ×
-release fraction − prior processed. Rounding is half-up to the cent.
+− deductions. The matrix **rate is keyed to the net commissionable amount**.
+
+What pays out this period, per rep:
+
+- **Standard / Financed** — pays on the cash actually cleared, at the rate, capped by
+  the delivered half:
+  `this period = rate × min(cleared cash capped at net, net × delivery fraction) × share − prior`.
+  Two holdbacks are shown on the statement: a **delivery holdback** (the undelivered
+  device's half, released when the PICO ships) and a **collection holdback** (delivered
+  but not yet cleared).
+- **In-House Financing** — 6% of each cleared payment (down payment + monthlies); no
+  delivery holdback (these are not pre-orders).
+- **Quarter Accelerator** — per rep, ≥ 6 straight-purchase devices in the quarter →
+  16%, retroactive within the run.
+- **Super Kicker** — per rep, ≥ $1,000,000 straight-purchase volume in the quarter →
+  22%, retroactive within the run.
+
+Rounding is half-up to the cent.
 
 ## File naming it expects
 
