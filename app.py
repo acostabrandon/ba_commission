@@ -109,6 +109,8 @@ with tabs[0]:
                 errors.append(f"{base}: not a readable .xlsx ({ex})"); return
             if o.get("order_number"):
                 orders[o["order_number"]] = o
+                # keep the raw workbook so the packet can attach the exact one-page detail
+                db.save_attachment(run_id, "detail_xlsx", f"{o['order_number']}_detail.xlsx", b)
             else:
                 errors.append(f"{base}: no Order Number found (is this a commission-detail workbook?)")
 
@@ -353,10 +355,24 @@ with tabs[3]:
         if missing:
             st.caption("No LPS PDF stored for: " + ", ".join(map(str, missing)) + " (packets will omit those LPS pages).")
         if st.button("Build per-rep packets", type="primary"):
+            # render each order's commission detail to a one-page PDF (exact sheet, no STATUS/version tail)
+            detail_by_order = {}
+            no_render = []
+            for o in res["orders"]:
+                onum = o["order_number"]
+                xb = db.get_attachment(run_id, f"{onum}_detail.xlsx", "detail_xlsx")
+                one = reports.render_detail_one_page(xb) if xb else None
+                if one:
+                    detail_by_order[onum] = one
+                else:
+                    no_render.append(str(onum))
+            if no_render:
+                st.caption("Used the generated one-page detail for: " + ", ".join(no_render)
+                           + " (exact-sheet render unavailable).")
             zbuf = io.BytesIO()
             with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for rid, s in res["rep_summary"].items():
-                    pdf = reports.build_rep_packet(rid, run_full, lps_by_order)
+                    pdf = reports.build_rep_packet(rid, run_full, lps_by_order, detail_by_order)
                     safe = (s["name"] or rid).replace(" ", "_")
                     zf.writestr(f"{rid}_{safe}_Commission_Packet.pdf", pdf)
             st.session_state["packets_zip"] = zbuf.getvalue()

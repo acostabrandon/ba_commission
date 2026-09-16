@@ -190,12 +190,24 @@ def parse_setup_reps(data: bytes) -> dict:
     ws = _find_table_anywhere(wb, "tblReps")
     reps = {}
     if ws is not None:
-        _, rows = _table_rows(ws, "tblReps")
+        headers, rows = _table_rows(ws, "tblReps")
+        idx = _header_index(headers)
+        ci_id = idx.get("rep id", 0)
+        ci_pay = next((v for k, v in idx.items() if "payroll" in k or "employee" in k), 1)
+        ci_name = next((v for k, v in idx.items() if "name" in k), 2)
+        ci_email = next((v for k, v in idx.items() if "email" in k), None)
+        ci_title = idx.get("title")
+        ci_terr = next((v for k, v in idx.items() if "territor" in k), None)
+
+        def g(row, i):
+            return row[i] if (i is not None and i < len(row)) else None
         for row in rows:
-            rid, payroll, name, email = (list(row) + [None, None, None, None])[:4]
+            rid = g(row, ci_id)
             if rid in (None, ""):
                 continue
-            reps[str(rid)] = {"payroll_id": payroll, "name": name, "email": email}
+            reps[str(rid)] = {"payroll_id": g(row, ci_pay), "name": g(row, ci_name),
+                              "email": g(row, ci_email), "title": g(row, ci_title),
+                              "territory": g(row, ci_terr)}
     return reps
 
 
