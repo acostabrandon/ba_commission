@@ -4,9 +4,49 @@ Team-shared: every payroll run is saved to the database, so anyone on the team c
 open the same in-progress run and pick up where others left off, until it's approved
 and locked. See README.md for one-time Streamlit Cloud + Postgres setup.
 """
-import io, zipfile, datetime
+import io, zipfile, datetime, re
 import streamlit as st
 import db, ingest, calc, reports
+
+
+def parse_overrides(rows, orders, reps_master, regional_tiers):
+    """Turn the override editor rows into calc's exec_overrides list, registering each
+    override person in reps_master so their statement shows name + title. Executive
+    overrides use their entered rate; Regional overrides look up the rate from the
+    tier matrix and label the type 'Regional Override - Tier N'."""
+    onums = [str(o["order_number"]) for o in orders]
+    out = []
+    warnings = []
+    for r in rows or []:
+        name = (r.get("name") or "").strip()
+        if not name:
+            continue
+        rid = "OVR-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        raw = (str(r.get("orders") or "all")).strip().lower()
+        if raw in ("", "all"):
+            scope = None
+        else:
+            scope = []
+            for tok in raw.replace(" ", "").split(","):
+                if not tok:
+                    continue
+                match = [on for on in onums if on.lower() == tok or on.lower().endswith(tok)]
+                scope += match or [tok]
+        kind = (r.get("kind") or "Executive").strip().lower()
+        if kind.startswith("reg"):
+            tier = (r.get("tier") or "Tier 1").strip()
+            rate = regional_tiers.get(tier)
+            ctype = f"Regional Override - {tier}"
+            if rate in (None, ""):
+                warnings.append(f"{name}: {tier} rate not set in the regional matrix — skipped.")
+                continue
+            rate = float(rate)
+        else:
+            rate = float(r.get("rate_pct") or 0) / 100.0
+            ctype = "Executive Override"
+        reps_master[rid] = {"name": name, "title": (r.get("title") or ""), "payroll_id": rid}
+        out.append({"rep_id": rid, "name": name, "rate": rate, "commission_type": ctype, "orders": scope})
+    return out, warnings
 
 st.set_page_config(page_title="BA Commission Calculator", page_icon="🧮", layout="wide")
 USER = st.session_state.setdefault("user", "")
@@ -194,6 +234,38 @@ with tabs[1]:
             if st.button("💾 Save statement details", disabled=locked):
                 save("Updated statement details"); st.rerun()
 
+        # ---- management overrides (executive / regional) ----
+        tiers_saved = payload.get("regional_tiers") or dict(calc.REGIONAL_TIERS)
+        ovr_seed = payload.get("exec_overrides_raw") or [
+            {"name": "", "title": "", "kind": "Executive", "tier": "Tier 1", "rate_pct": 2.0, "orders": "all"}]
+        with st.expander("Management overrides (executive / regional) — % on the commissionable order, same holdbacks",
+                         expanded=False):
+            st.markdown("**Regional override tier matrix** — rate per tier (Tier 1 = 3%; add 2–4 when known).")
+            tier_rows = [{"tier": t, "rate_pct": (None if v in (None, "") else round(float(v) * 100, 2))}
+                         for t, v in tiers_saved.items()]
+            tier_edit = st.data_editor(
+                tier_rows, key="tier_editor", disabled=locked, hide_index=True, num_rows="fixed",
+                column_config={"tier": st.column_config.TextColumn("Tier", disabled=True),
+                               "rate_pct": st.column_config.NumberColumn("Rate %", format="%.2f",
+                                                                         min_value=0.0, max_value=100.0)})
+            payload["regional_tiers"] = {r["tier"]: (None if r.get("rate_pct") in (None, "") else float(r["rate_pct"]) / 100.0)
+                                         for r in tier_edit if r.get("tier")}
+
+            st.caption("Each override person gets their own commission report. Executive uses the Rate % entered; "
+                       "Regional uses the tier matrix above. Orders: 'all', or a comma list like 002, 006, 007.")
+            ovr_edit = st.data_editor(
+                ovr_seed, num_rows="dynamic", key="ovr_editor", disabled=locked, hide_index=True,
+                column_config={
+                    "name": st.column_config.TextColumn("Name"),
+                    "title": st.column_config.TextColumn("Title"),
+                    "kind": st.column_config.SelectboxColumn("Kind", options=["Executive", "Regional"]),
+                    "tier": st.column_config.SelectboxColumn("Tier (regional)", options=list(tiers_saved.keys())),
+                    "rate_pct": st.column_config.NumberColumn("Rate % (executive)", format="%.2f",
+                                                              min_value=0.0, max_value=100.0),
+                    "orders": st.column_config.TextColumn("Orders (all / 002,006,007)"),
+                })
+            payload["exec_overrides_raw"] = [r for r in ovr_edit if (r.get("name") or "").strip()]
+
         for o in orders:
             onum = str(o["order_number"])
             ov = overrides.setdefault(onum, {})
@@ -268,9 +340,16 @@ with tabs[1]:
 
         cc1, cc2 = st.columns([1, 3])
         if cc1.button("💾 Save & recalculate", disabled=locked, type="primary"):
-            res, summ, exc = calc.calculate(orders, payload.get("reps_master", {}),
+            reps_master = payload.setdefault("reps_master", {})
+            tiers_now = payload.get("regional_tiers") or dict(calc.REGIONAL_TIERS)
+            exec_ovr, ovr_warn = parse_overrides(payload.get("exec_overrides_raw", []), orders, reps_master, tiers_now)
+            payload["exec_overrides"] = exec_ovr
+            for w in ovr_warn:
+                st.warning(w)
+            res, summ, exc = calc.calculate(orders, reps_master,
                                             payload.get("opening_history", []), overrides=overrides,
-                                            period=(run["period_start"], run["period_end"]))
+                                            period=(run["period_start"], run["period_end"]),
+                                            exec_overrides=exec_ovr)
             payload["results"] = {"orders": res, "rep_summary": summ, "exceptions": exc,
                                   "control": calc.control_totals(res)}
             save("Recalculated")

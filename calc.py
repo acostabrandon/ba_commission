@@ -39,6 +39,9 @@ ACCEL_DEVICES = 6
 ACCEL_RATE = 0.16
 KICKER_VOLUME = 1_000_000.0
 KICKER_RATE = 0.22
+EXEC_OVERRIDE_RATE = 0.02
+# Regional override matrix — Tier 1 confirmed at 3%; Tiers 2-4 rates TBD (fill when known).
+REGIONAL_TIERS = {"Tier 1": 0.03, "Tier 2": None, "Tier 3": None, "Tier 4": None}
 STRAIGHT = "Straight Purchase"
 FINANCED = "Financed Purchase"
 INHOUSE = "In-House Financed Purchase"
@@ -112,7 +115,7 @@ def _cleared(payments, period, notes=None, onum=""):
     return r2(total)
 
 
-def calculate(orders, reps_master, opening_history, overrides=None, period=None):
+def calculate(orders, reps_master, opening_history, overrides=None, period=None, exec_overrides=None):
     overrides = overrides or {}
     exceptions = []
 
@@ -255,6 +258,51 @@ def calculate(orders, reps_master, opening_history, overrides=None, period=None)
             collection_factor=coll_disp, release_fraction=rel,
             reps=rep_lines, deal_commission=(order_deal_comm if order_deal_comm else None),
         ))
+
+    # ---- management overrides (CEO / VP / regional), on cleared cash, same gates ----
+    if exec_overrides:
+        by_num = {str(o["order_number"]): o for o in order_results}
+        all_nums = list(by_num.keys())
+        for ovs in exec_overrides:
+            rid = str(ovs.get("rep_id") or ovs.get("name") or "OVR")
+            rate = float(ovs.get("rate") or 0)
+            ctype = ovs.get("commission_type") or "Override"
+            name = reps_master.get(rid, {}).get("name") or ovs.get("name") or rid
+            scope = ovs.get("orders") or all_nums
+            for onum in scope:
+                orr = by_num.get(str(onum))
+                if not orr:
+                    exceptions.append(f"{onum}: override target order not found for {name}")
+                    continue
+                net = orr["net_commissionable"] or 0
+                rel = orr["release_fraction"]
+                pb = orr.get("payable_base")
+                if pb is None:                       # in-house order: base on cleared, capped at net
+                    pb = r2(min(orr.get("cleared") or 0, net))
+                full = r2(net * rate)
+                earned = r2(rate * pb)
+                delivered_base = r2(net * rel)
+                if pb >= delivered_base:
+                    coll_hold = 0.0
+                    deliv_hold = r2(full - earned)
+                else:
+                    delivered_full = r2(full * rel)
+                    deliv_hold = r2(full - delivered_full)
+                    coll_hold = r2(delivered_full - earned)
+                prior = _prior_for(onum, rid, opening_history)
+                this_period = r2(earned - prior)
+                orr["reps"].append(dict(
+                    rep_id=rid, rep_name=name, share=None, commission_type=ctype,
+                    effective_rate=rate, full_commission=full, delivery_factor=rel,
+                    collection_factor=(None if delivered_base == 0 else round(pb / delivered_base, 6)),
+                    delivery_holdback=deliv_hold, collection_holdback=coll_hold,
+                    earned_to_date=earned, prior_processed=prior, this_period=this_period,
+                    is_override=True))
+                acc = rep_summary.setdefault(rid, {"name": name, "this_period": 0.0, "full": 0.0, "lines": []})
+                acc["this_period"] = r2(acc["this_period"] + this_period)
+                acc["full"] = r2(acc["full"] + full)
+                acc["lines"].append(dict(order_number=onum, customer=orr.get("customer"),
+                                         commission_type=ctype, this_period=this_period, full_commission=full))
 
     return order_results, rep_summary, exceptions
 

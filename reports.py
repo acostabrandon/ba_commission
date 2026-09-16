@@ -286,40 +286,50 @@ def build_rep_packet(rep_id, run, lps_by_order: dict, detail_by_order: dict = No
     quarterly_rev = rep_sf.get("quarterly_revenue") or "—"
     comments = rep_sf.get("comments") or ""
 
+    is_override_report = bool(lines) and all(rl.get("is_override") for _, rl in lines)
     total_comm_full = 0.0        # sum of Total Commission (full deal, this rep)
     commissionable_total = 0.0
     devices_sold = 0
     tiers = set()
-    detail_rows = []
-    wf = []                      # holdback waterfall: (order, full, deliv%, cash_cleared, dhb, chb, earned)
-    dhb_total = chb_total = cleared_total = 0.0
+    rowsd = []                   # one dict per order line
+    dhb_total = chb_total = cleared_total = applied_total = 0.0
     for o, rl in lines:
         share = rl["share"] or 0
         inhouse = o.get("finance_type") == "In-House Financed Purchase"
         if inhouse:
             commissionable = r2((o.get("cleared") or 0) * share)
             full = rl.get("earned_to_date") or 0
+        elif rl.get("is_override"):
+            commissionable = o.get("net_commissionable") or 0     # override is on the whole order
+            full = rl.get("full_commission") or 0
         else:
             commissionable = r2((o["net_commissionable"] or 0) * share)
             full = rl.get("full_commission") or 0
         earned = rl.get("earned_to_date") or 0
+        rate = rl.get("effective_rate") or 0
+        applied = round(earned / rate, 2) if rate else 0.0        # cash the rate was applied to
         dhb = rl.get("delivery_holdback") or 0
         chb = rl.get("collection_holdback") or 0
-        cash_cleared = r2((o.get("cleared") or 0) * share)
+        cash_cleared = o.get("cleared") or 0 if rl.get("is_override") else r2((o.get("cleared") or 0) * share)
         commissionable_total = r2(commissionable_total + commissionable)
         total_comm_full = r2(total_comm_full + full)
         dhb_total = r2(dhb_total + dhb); chb_total = r2(chb_total + chb)
-        cleared_total = r2(cleared_total + cash_cleared)
+        cleared_total = r2(cleared_total + cash_cleared); applied_total = r2(applied_total + applied)
         devices_sold += 2 if "bundle" in str(o.get("configuration") or "").lower() else 1
         tiers.add(rl.get("commission_type"))
-        ctype_display = o.get("release_rule") or rl.get("commission_type") or "—"
-        detail_rows.append([(o.get("customer") or "")[:44], o["order_number"], ctype_display,
-                            money(commissionable), pct(rl.get("effective_rate")), money(full)])
-        wf.append((o["order_number"], full, rl.get("delivery_factor"), cash_cleared, dhb, chb, earned))
+        if rl.get("is_override"):
+            ctype_display = rl.get("commission_type") or "Override"
+        else:
+            ctype_display = o.get("release_rule") or rl.get("commission_type") or "—"
+        rowsd.append(dict(order=o["order_number"], customer=(o.get("customer") or "")[:44],
+                          ctype=ctype_display, rate=rate, net=(o.get("net_commissionable") or 0),
+                          full=full, cash=cash_cleared, applied=applied, dhb=dhb, chb=chb, earned=earned))
     prior = r2(sum((rl["prior_processed"] or 0) for _, rl in lines))
     earned_total = r2(sum((rl.get("earned_to_date") or 0) for _, rl in lines))
     to_pay = r2(sum((rl["this_period"] or 0) for _, rl in lines))
-    if "Super Kicker" in tiers:
+    if is_override_report:
+        tier_achieved = " / ".join(sorted({rl.get("commission_type") or "Override" for _, rl in lines}))
+    elif "Super Kicker" in tiers:
         tier_achieved = "Super Kicker (22%)"
     elif "Quarter Accelerator" in tiers:
         tier_achieved = "Quarter Accelerator (16%)"
@@ -356,50 +366,88 @@ def build_rep_packet(rep_id, run, lps_by_order: dict, detail_by_order: dict = No
            ["Territory", Paragraph(str(territory), BODY), "Statement Date", _est_today()]]
     S.append(kv_table(emp, [1.15 * inch, 2.55 * inch, 1.2 * inch, 2.4 * inch]))
 
-    # ---- one consolidated commission summary (deal + holdbacks + earned) ----
-    S.append(Paragraph("Commission Summary", SEC))
-
+    # ---- commission summary ----
     def hb(x):
         return "(${:,.2f})".format(x) if (x and x > 0.005) else "—"
 
     CELL = ParagraphStyle("cell", parent=BODY, fontSize=8, leading=9.5)
-    wf_by_order = {w[0]: w for w in wf}
-    srows = [["Order / Customer", "Commission\nType", "Total\nCommission",
-              "Delivery\nHoldback", "Collection\nHoldback", "Earned\nThis Period"]]
-    for m in detail_rows:
-        cust, onum, ctype = m[0], m[1], m[2]
-        _, full, _, _, dhb, chb, earned = wf_by_order[onum]
-        srows.append([Paragraph(f"<b>{onum}</b><br/>{cust}", CELL), ctype,
-                      money(full), hb(dhb), hb(chb), money(earned)])
-    nrows = len(detail_rows)
-    srows.append(["TOTAL", "", money(total_comm_full), hb(dhb_total), hb(chb_total), money(earned_total)])
-    srows.append(["Less: Prior Period Adjustments", "", "", "", "", money(-prior) if prior else "$0.00"])
-    srows.append(["Total Commission to be Paid", "", "", "", "", money(to_pay)])
-    st = Table(srows, colWidths=[2.15 * inch, 1.0 * inch, 1.02 * inch, 1.02 * inch, 1.08 * inch, 1.03 * inch])
-    total_r = nrows + 1
-    less_r = nrows + 2
-    pay_r = nrows + 3
-    st.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(GREEN)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("ROWBACKGROUNDS", (0, 1), (-1, nrows), [colors.white, colors.HexColor(LIGHTG)]),
-        ("ALIGN", (2, 0), (-1, -1), "RIGHT"), ("ALIGN", (0, 0), (1, -1), "LEFT"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("GRID", (0, 0), (-1, total_r), 0.25, colors.HexColor("#DDDDDD")),
-        ("FONTNAME", (0, total_r), (-1, total_r), "Helvetica-Bold"),
-        ("LINEABOVE", (0, total_r), (-1, total_r), 0.7, colors.black),
-        ("TEXTCOLOR", (3, 1), (4, total_r), colors.HexColor("#B00000")),   # holdbacks in red
-        ("SPAN", (0, less_r), (4, less_r)), ("SPAN", (0, pay_r), (4, pay_r)),
-        ("FONTNAME", (0, pay_r), (-1, pay_r), "Helvetica-Bold"),
-        ("BACKGROUND", (0, pay_r), (-1, pay_r), colors.HexColor(LIGHTG)),
-        ("TEXTCOLOR", (0, pay_r), (-1, pay_r), colors.HexColor(GREEN_DK)),
-        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    S.append(st)
-    S.append(Paragraph("<b>Total Commission</b> is the full commission on the deal (net × rate × your share). "
-                       "The <b>Delivery Holdback</b> (50% while the Boston Pico is on backorder) releases when the Pico "
-                       "ships; the <b>Collection Holdback</b> releases as the customer's balance clears. "
-                       "Total Commission − holdbacks = <b>Earned This Period</b>.", SMALL))
+
+    if is_override_report:
+        # detailed override table: rate and the cleared-cash basis are shown so
+        # rate × cash basis = earned is transparent on the cover itself.
+        S.append(Paragraph("Override Summary", SEC))
+        srows = [["Order / Customer", "Type", "Rate", "Commissionable\n(order net)",
+                  "Full Override\n(rate × net)", "Delivery\nHoldback", "Collection\nHoldback", "Earned\nThis Period"]]
+        TYPECELL = ParagraphStyle("typecell", parent=BODY, fontSize=7, leading=8)
+        for m in rowsd:
+            srows.append([Paragraph(f"<b>{m['order']}</b><br/>{m['customer']}", CELL),
+                          Paragraph(m["ctype"], TYPECELL),
+                          pct(m["rate"]), money(m["net"]), money(m["full"]),
+                          hb(m["dhb"]), hb(m["chb"]), money(m["earned"])])
+        nrows = len(rowsd)
+        srows.append(["TOTAL", "", "", money(commissionable_total), money(total_comm_full),
+                      hb(dhb_total), hb(chb_total), money(earned_total)])
+        srows.append(["Less: Prior Period Adjustments", "", "", "", "", "", "", money(-prior) if prior else "$0.00"])
+        srows.append(["Total Override to be Paid", "", "", "", "", "", "", money(to_pay)])
+        st = Table(srows, colWidths=[1.42 * inch, 1.15 * inch, 0.42 * inch, 0.9 * inch,
+                                     0.9 * inch, 0.8 * inch, 0.8 * inch, 0.86 * inch])
+        total_r, less_r, pay_r = nrows + 1, nrows + 2, nrows + 3
+        st.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(GREEN)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 7.3),
+            ("ROWBACKGROUNDS", (0, 1), (-1, nrows), [colors.white, colors.HexColor(LIGHTG)]),
+            ("ALIGN", (2, 0), (-1, -1), "RIGHT"), ("ALIGN", (0, 0), (1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, total_r), 0.25, colors.HexColor("#DDDDDD")),
+            ("FONTNAME", (0, total_r), (-1, total_r), "Helvetica-Bold"),
+            ("LINEABOVE", (0, total_r), (-1, total_r), 0.7, colors.black),
+            ("TEXTCOLOR", (5, 1), (6, total_r), colors.HexColor("#B00000")),   # holdbacks in red
+            ("SPAN", (0, less_r), (6, less_r)), ("SPAN", (0, pay_r), (6, pay_r)),
+            ("FONTNAME", (0, pay_r), (-1, pay_r), "Helvetica-Bold"),
+            ("BACKGROUND", (0, pay_r), (-1, pay_r), colors.HexColor(LIGHTG)),
+            ("TEXTCOLOR", (0, pay_r), (-1, pay_r), colors.HexColor(GREEN_DK)),
+            ("TOPPADDING", (0, 0), (-1, -1), 3.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+        ]))
+        S.append(st)
+        S.append(Paragraph("Your <b>Rate</b> is applied to the order's <b>Commissionable</b> amount (net commissionable), "
+                           "giving the <b>Full Override</b> (rate × net). The <b>Delivery Holdback</b> (50% while the Boston "
+                           "Pico is on backorder) and the <b>Collection Holdback</b> (commission on cash not yet cleared) "
+                           "explain why this period pays less than the full override — they release as the Pico ships and the "
+                           "customer's balance clears. Full Override − holdbacks = <b>Earned This Period</b>.", SMALL))
+    else:
+        S.append(Paragraph("Commission Summary", SEC))
+        srows = [["Order / Customer", "Commission\nType", "Total\nCommission",
+                  "Delivery\nHoldback", "Collection\nHoldback", "Earned\nThis Period"]]
+        for m in rowsd:
+            srows.append([Paragraph(f"<b>{m['order']}</b><br/>{m['customer']}", CELL), m["ctype"],
+                          money(m["full"]), hb(m["dhb"]), hb(m["chb"]), money(m["earned"])])
+        nrows = len(rowsd)
+        srows.append(["TOTAL", "", money(total_comm_full), hb(dhb_total), hb(chb_total), money(earned_total)])
+        srows.append(["Less: Prior Period Adjustments", "", "", "", "", money(-prior) if prior else "$0.00"])
+        srows.append(["Total Commission to be Paid", "", "", "", "", money(to_pay)])
+        st = Table(srows, colWidths=[2.15 * inch, 1.0 * inch, 1.02 * inch, 1.02 * inch, 1.08 * inch, 1.03 * inch])
+        total_r, less_r, pay_r = nrows + 1, nrows + 2, nrows + 3
+        st.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(GREEN)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ROWBACKGROUNDS", (0, 1), (-1, nrows), [colors.white, colors.HexColor(LIGHTG)]),
+            ("ALIGN", (2, 0), (-1, -1), "RIGHT"), ("ALIGN", (0, 0), (1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, total_r), 0.25, colors.HexColor("#DDDDDD")),
+            ("FONTNAME", (0, total_r), (-1, total_r), "Helvetica-Bold"),
+            ("LINEABOVE", (0, total_r), (-1, total_r), 0.7, colors.black),
+            ("TEXTCOLOR", (3, 1), (4, total_r), colors.HexColor("#B00000")),   # holdbacks in red
+            ("SPAN", (0, less_r), (4, less_r)), ("SPAN", (0, pay_r), (4, pay_r)),
+            ("FONTNAME", (0, pay_r), (-1, pay_r), "Helvetica-Bold"),
+            ("BACKGROUND", (0, pay_r), (-1, pay_r), colors.HexColor(LIGHTG)),
+            ("TEXTCOLOR", (0, pay_r), (-1, pay_r), colors.HexColor(GREEN_DK)),
+            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        S.append(st)
+        S.append(Paragraph("<b>Total Commission</b> is the full commission on the deal (net × rate × your share). "
+                           "The <b>Delivery Holdback</b> (50% while the Boston Pico is on backorder) releases when the Pico "
+                           "ships; the <b>Collection Holdback</b> releases as the customer's balance clears. "
+                           "Total Commission − holdbacks = <b>Earned This Period</b>.", SMALL))
 
     # ---- quarter performance summary ----
     S.append(Paragraph("Quarter Performance Summary", SEC))
